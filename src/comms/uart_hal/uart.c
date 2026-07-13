@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
 #include "uart.h"
 #include "FreeRTOS.h"
+#include "FreeRTOSConfig.h"
+#include "comms/comms.h"
 #include "pico.h"
 #include "hardware/uart.h"
 #include "hardware/irq.h"
@@ -7,56 +11,58 @@
 #include "portmacro.h"
 #include <hardware/regs/intctrl.h>
 #include <hardware/structs/io_bank0.h>
+#include <pico/platform/panic.h>
 #include <stdbool.h>
 #include <stddef.h>
 
 
-#define BAUDRATE 115200
-
-#define DATA_BITS 8
-#define STOP_BITS 1
-#define PARITY_BITS 0
-
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
-
-#define RX_BUFFER_SIZE 512
-#define TX_BUFFER_SIZE 512
-
-#define TX_TASK_PRIORITY 1
-
-enum hal_state {
+enum driver_state {
     INITIALIZED,
     DEINITIALIZED,
-    SUSPENDED
 };
 
-/* HAL state machine
-
-
+/* Driver state machine
     INITIALIZED <-> DEINITIALIZED
-       /|\              /|\  
-        |                |
-       \|/               |
-    SUSPENDED  -----------
-        
 */
 
-static StreamBufferHandle_t htx;
-static StreamBufferHandle_t hrx;
-static enum hal_state state = DEINITIALIZED;
-static TaskHandle_t tx_handle = NULL;
-static uart_inst_t* Uart_id = NULL;
-static uint Uart_irq = 0;
+struct uart_description_t {
+    struct uPipe_t* pipe;
+    struct uart_opts_t opts;
+    TaskHandle_t tx_task; // Pointer not needed since its a pointer type
+    uart_inst_t* id;
+    int irq;    
+    enum driver_state state;
+};
 
-void uart_irq_handler(void) {
+static struct uart_description_t uart0_desc = {
+    NULL,
+    {0, 0, 0, 0, 0, 0},
+    NULL,
+    NULL,
+    UART0_IRQ,
+    DEINITIALIZED
+};
+
+static struct uart_description_t uart1_desc = {
+    NULL,
+    {0, 0, 0, 0, 0, 0},
+    NULL,
+    NULL,
+    UART1_IRQ,
+    DEINITIALIZED
+};
+
+
+void uart0_irq_handler(void) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (uart0_desc.state != INITIALIZED || uart0_desc.pipe == NULL) panic("UART0: Corrupted UART Driver state.");
 
-    while (uart_is_readable(Uart_id)) {
-        uint8_t ch = uart_getc(Uart_id);
+
+    while (uart_is_readable(uart0)) {
+        uint8_t ch = uart_getc(uart0);
 
         xStreamBufferSendFromISR(
-            hrx,
+            uart0_desc.pipe->rx,
             &ch,
             1,
             &xHigherPriorityTaskWoken
@@ -66,12 +72,32 @@ void uart_irq_handler(void) {
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-void uart_tx_task() {
+void uart1_irq_handler(void) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (uart1_desc.state != INITIALIZED || uart1_desc.pipe == NULL) panic("UART0: Corrupted UART Driver state."); 
+
+    while (uart_is_readable(uart1)) {
+        uint8_t ch = uart_getc(uart1);
+
+        xStreamBufferSendFromISR(
+            uart1_desc.pipe->rx,
+            &ch,
+            1,
+            &xHigherPriorityTaskWoken
+        );
+    }
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void uart_tx_task(void* desc_ptr) {
+    struct uart_description_t* desc = (struct uart_description_t*)desc_ptr;
     while (true) {
-        uint8_t bytes[32];
-        size_t bytes_read = xStreamBufferReceive(htx, bytes, 32, 5);
+        if (desc->state != INITIALIZED || desc->pipe == NULL) panic("UART0: Corrupted UART0 Driver state."); 
+        uint8_t byte;
+        size_t bytes_read = xStreamBufferReceive(desc->pipe->tx, &byte, 1, 1);
         for (size_t i = 0; i < bytes_read; i++) {
-            uart_putc_raw(Uart_id, (char)bytes[i]);
+            uart_putc_raw(desc->id, (char)byte);
         }
     }
 }
@@ -84,133 +110,81 @@ bool baud_within_tolarence(uint expected, uint actual) {
     return true;
 }
 
-/*
-    Initializes the UART HAL.
 
-    constructs rx and tx stream buffers, and the HAL keeps internal references to them until deinit() is called.
-    caller owns the stream buffers and must ensure that they are valid for the lifetime of HAL (ie deinit() call) and free them after deinit().
-*/
-bool uart_hal_init(StreamBufferHandle_t *rx, StreamBufferHandle_t *tx, uart_inst_t* uartid, uint uartirq) {
-    if (state != DEINITIALIZED) return true; // Cannot initilize if we already are.
-    Uart_id = uartid;
-    Uart_irq = uartirq;
+bool uart_drv_init(struct uPipe_t* pipe, struct uart_opts_t opts, uart_inst_t* uart_inst) {
+    struct uart_description_t* desc = NULL;
+    if (uart_inst == uart1) desc = &uart1_desc;
+    else if (uart_inst == uart0) desc = &uart0_desc;
+    else return true;
 
-    uint baud = uart_init(Uart_id, BAUDRATE);
-    if (baud_within_tolarence(BAUDRATE, baud)) {
+    if (desc->state != DEINITIALIZED) return true; // Cannot initilize if we already are.
+
+    uint baud_real = uart_init(uart_inst, opts.baud);
+    if (baud_within_tolarence(opts.baud, baud_real)) {
         // UART did not init at our desired baud.
-        uart_deinit(Uart_id);
+        uart_deinit(uart_inst);
         return true;
     }
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(opts.Txpin, GPIO_FUNC_UART);
+    gpio_set_function(opts.Rxpin, GPIO_FUNC_UART);
 
 
-    uart_set_hw_flow(Uart_id, false, false);
+    uart_set_hw_flow(uart_inst, false, false);
 
-    *rx = xStreamBufferCreate(RX_BUFFER_SIZE, 1);
-    *tx = xStreamBufferCreate(TX_BUFFER_SIZE, 1);
+    pipe->internal_data = desc;
+    pipe->close = uart_drv_deinit;
+    desc->pipe = pipe;
+    desc->opts.Txpin = opts.Txpin;
+    desc->opts.Rxpin = opts.Rxpin;
+    desc->id = uart_inst;
 
-    if (*rx == NULL) { // Buffer init failed
-        
-        if (*tx != NULL) vStreamBufferDelete(*tx);
-
-
-        gpio_set_function(UART_TX_PIN, GPIO_FUNC_NULL);
-        gpio_set_function(UART_RX_PIN, GPIO_FUNC_NULL);
-       
-        tx_handle = NULL;
-        uart_deinit(Uart_id);
-
-        return true; 
-    }
-
-    if (*tx == NULL) { // Buffer init failed
-
-        if (*rx != NULL) vStreamBufferDelete(*rx);
-
-        gpio_set_function(UART_TX_PIN, GPIO_FUNC_NULL);
-        gpio_set_function(UART_RX_PIN, GPIO_FUNC_NULL);
-       
-        tx_handle = NULL;
-        uart_deinit(Uart_id);
-
-        return true;
-    }
-
-    // Set internal references of the HAL
-    hrx = *rx;
-    htx = *tx;
-
-
-    if (xTaskCreate(uart_tx_task, "tx_drainer", 512, NULL, TX_TASK_PRIORITY, &tx_handle) != pdPASS) {
+    if (xTaskCreate(uart_tx_task, "uart_tx", configMINIMAL_STACK_SIZE, desc, HARDCOMM_DEFAULT_PRIORITY, &desc->tx_task) != pdPASS) {
         // Failed to create TX drainer.
-        gpio_set_function(UART_TX_PIN, GPIO_FUNC_NULL);
-        gpio_set_function(UART_RX_PIN, GPIO_FUNC_NULL);
+        gpio_set_function(opts.Txpin, GPIO_FUNC_NULL);
+        gpio_set_function(opts.Rxpin, GPIO_FUNC_NULL);
 
-        vStreamBufferDelete(*rx);
-        vStreamBufferDelete(*tx);
+        desc->pipe = NULL;
 
-        hrx = NULL;
-        htx = NULL;
-
-        uart_deinit(Uart_id);
+        uart_deinit(uart_inst);
 
         return true;
     }
 
-    uart_set_fifo_enabled(Uart_id, true);
+    uart_set_fifo_enabled(uart_inst, true);
     
-    uart_set_format(Uart_id, DATA_BITS, STOP_BITS, PARITY_BITS);
+    uart_set_format(uart_inst, opts.data_bits, opts.stop_bits, opts.parity_bits);
 
-    irq_set_priority(Uart_irq, (1 << 7));
+    irq_set_priority(desc->irq, (1 << 7));
 
-    irq_set_exclusive_handler(Uart_irq, uart_irq_handler);
+    if (uart_inst == uart0) irq_set_exclusive_handler(desc->irq, uart0_irq_handler);
+    if (uart_inst == uart1) irq_set_exclusive_handler(desc->irq, uart1_irq_handler);
 
-    irq_set_enabled(Uart_irq, true);
+    irq_set_enabled(desc->irq, true);
 
-    uart_set_irq_enables(Uart_id, true, false);
-    state = INITIALIZED;
+    uart_set_irq_enables(uart_inst, true, false);
+    desc->state = INITIALIZED;
     return false;
 }
 
-// Suspends UART HAL.
-bool uart_hal_suspend(void) {
-    // To suspend UART, we first have to suspend the reciever ISR (Disable it)
-    // Then suspend the TX task aaand... thats about it
-    if (state != INITIALIZED) return true; // Cannot suspend while deinitialized or already suspended.
 
-    vTaskSuspend(tx_handle);
-    uart_set_irq_enables(Uart_id, false, false);
-    state = SUSPENDED;
-    return false;
-}
 
-// Resumes the UART HAL.
-bool uart_hal_resume(void) {
-    if (state != SUSPENDED) return true; // Cannot resume if we are not suspended
+// deinits and garbage collects the UART driver.
+void uart_drv_deinit(struct uPipe_t* consumed) {
+    struct uart_description_t* desc = (struct uart_description_t*)consumed->internal_data;
+    irq_set_enabled(desc->irq, false);
+    if (desc->state == DEINITIALIZED) return; // no-op 
 
-    vTaskResume(tx_handle);
-    uart_set_irq_enables(Uart_id, true, false);
-    state = INITIALIZED;
-    return false;
-}
+    uart_set_irq_enables(desc->id, false, false);
+    vTaskDelete(desc->tx_task);
+    desc->tx_task = NULL;
+    desc->pipe = NULL;
 
-// deinits and garbage collects the UART HAL.
-bool uart_hal_deinit(void) {
-    if (state != INITIALIZED && state != SUSPENDED) return true; // cannot deinit if we are not init()ed
 
-    uart_set_irq_enables(Uart_id, false, false);
-    vTaskDelete(tx_handle);
-    tx_handle = NULL;
+    gpio_set_function(desc->opts.Rxpin, GPIO_FUNC_NULL);
+    gpio_set_function(desc->opts.Txpin, GPIO_FUNC_NULL);
 
-    htx = NULL;
-    hrx = NULL;
-
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_NULL);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_NULL);
-
-    state = DEINITIALIZED;
-    return false;
+    uart_deinit(desc->id);
+    desc->state = DEINITIALIZED;
 }
 
 

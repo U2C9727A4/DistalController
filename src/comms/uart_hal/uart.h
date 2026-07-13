@@ -1,29 +1,30 @@
 #ifndef UARTHAL_H
 #define UARTHAL_H
-#include "FreeRTOS.h"
-#include "task.h"
+#include <FreeRTOS.h>
+#include <task.h>
 #include "queue.h"
 #include "stream_buffer.h"
 #include <hardware/uart.h>
+#include <stdint.h>
+#include "comms/comms.h"
 
+struct uart_opts_t {
+    uint Rxpin;
+    uint Txpin;
+    uint baud;
+    uint8_t data_bits;
+    uint8_t stop_bits;
+    uint8_t parity_bits;
+};
 
-// Initilize UART HAL. rx is produced on, and tx is consumed from.
-// Mutable borrows rx and tx stream buffers. (they MUST be uninitialized!)
+// Initilize UART
+// Assumes the streams on the pipe are initialized.
 // on failure, returns true.
-// on success, the UART HAL owns the producing end of rx and consuming end of tx and the lifetime of these buffers (An internal reference is kept.)
-extern bool uart_hal_init(StreamBufferHandle_t *rx, StreamBufferHandle_t *tx, uart_inst_t* uartid, uint uartirq);
+// on success, the driver owns the producing end of rx, and consuming end of tx.
+// The pipe must have the same lifetime of uart. (Ie deinit() or pipe's close function should be called before pipe goes out of scope)
+extern bool uart_drv_init(struct uPipe_t* pipe, struct uart_opts_t opts, uart_inst_t* uart_inst);
 
-// Deinitilize UART HAL.
-// Returns true on error.
-extern bool uart_hal_deinit();
-
-// Suspends the UART HAL.
-// returns true if suspension fails.
-extern bool uart_hal_suspend();
-
-
-// Resumes the UART HAL after suspension.
-// Returns true if resume fails.
-extern bool uart_hal_resume();
+// Deinitialize UART0.
+extern void uart_drv_deinit(struct uPipe_t* consumed);
 
 #endif

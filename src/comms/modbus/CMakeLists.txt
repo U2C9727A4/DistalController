@@ -12,8 +12,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nanomodbus)
 
 target_link_libraries(modbus PRIVATE
-    FreeRTOS-Kernel-Heap4
-    pico_sdk 
+    freertos_kernel
+    pico_stdlib 
     nanomodbus
 )
 

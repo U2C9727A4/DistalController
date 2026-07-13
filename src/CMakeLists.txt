@@ -2,20 +2,16 @@ add_executable(controller
     boot.c
 )
 
-target_include_directories(FreeRTOS-Kernel INTERFACE
-    ${CMAKE_CURRENT_LIST_DIR} 
-)
-
 
 
 target_link_libraries(controller PUBLIC
-    pico_stdlib 
-    FreeRTOS-Kernel-Heap4 
+    pico_stdlib
+    freertos_kernel
 )
 
 
 
-set(subprojects comms sandbox)
+set(subprojects comms sandbox common)
 
 foreach(dir IN LISTS subprojects)
     target_include_directories(controller PRIVATE ${dir})
@@ -24,4 +20,8 @@ endforeach()
 
 target_link_libraries(controller PRIVATE
     comms
+    sandbox
+    common
 )
+
+pico_add_extra_outputs(controller)
